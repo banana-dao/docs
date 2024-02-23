@@ -18,7 +18,7 @@ If any deposits are pending, the value of each deposit and the value of each exi
 
 ### Liquidity Mining
 
-The vault contract exposes interfaces to manage the vault's liquidity in Osmosis concentrated liquidity pools through application of an off-chain [strategy](../vault_app/strategy.md). Operation is fairly straightforward, with the operator able to create, add to, and withdraw liquidity positions, with handling to ensure that the vault's active assets are not overdrawn.
+The vault contract exposes interfaces to manage the vault's liquidity in Osmosis concentrated liquidity pools through application of an off-chain [strategy](./vault_app.md#strategy). Operation is fairly straightforward, with the operator able to create, add to, and withdraw liquidity positions, with handling to ensure that the vault's active assets are not overdrawn.
 
 Liquidity rewards, in the form of incentives and swap fees, are automatically compounded into the vault's assets after commission is deducted.
 
