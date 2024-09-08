@@ -8,13 +8,21 @@ In its most basic implementation, a vault is a smart contract that allows users 
 
 The Banana Vaults contract contains basic interfaces to interact with [Osmosis](https://osmosis.zone) concentrated liquidity pools. An operator is designated to manage the vault's liquidity. The contract is relatively generalized, allowing anyone to create a vault with their own strategy. It is designed to be as simple as possible for users to interact with, while still providing a high level of security and flexibility.
 
-### Shares
+The Banana Vaults source code is available on [Github](https://github.com/banana-dao/banana-vaults/tree/v0.5.1).
 
-When a user deposits assets into the vault, they receive a proportional share of the vault's total assets, which can be redeemed by withdrawing. This share is recorded as a `ratio`, a percentage of the total assets that the user owns. The ratio is calculated by the function `ProcessNewEntriesAndExits`. As the vault is required to be instantiated with some assets, the instantiator's initial ratio will be 1. Deposits and withdrawals are processed after the configured `min_update_frequency` has passed, and only when the vault's LP position is fully closed.
+### Tokens
 
-If any withdrawals are pending they will be processed before any deposits. For each account that is pending withdraw, their share of the total active vault assets is calculated according to their ratio and sent to them.
+When a user deposits assets into the vault, they receive tokens representing a proportional share of the vault's total assets, which can be redeemed by burning. The amount of tokens received is calculated by the function `process_mints`. As the vault is required to be instantiated with some assets, the instantiator will receive a predetermined `initial_mint`.
 
-If any deposits are pending, the value of each deposit and the value of each existing account share that has not exited is calculated and the new ratio for each account is set based on their proportion of the resulting total dollar value.
+When a user deposits assets, they don't immediately receive tokens. Instead, their deposit is queued for processing. The process_mints function is called to mint tokens for pending deposits. This function calculates the number of tokens to be minted based on the current value of the vault's assets and the value of the deposited assets.
+
+Users can initiate a withdrawal by requesting to burn their tokens. Similar to deposits, withdrawals are queued for processing. The process_burns function is called to process pending withdrawals. It calculates the amount of assets to be returned based on the number of tokens being burned and the current value of the vault's assets.
+
+Benefits of tokenization include:
+
+- Simplified Accounting: Users can easily track their share of the vault by monitoring their token balance.
+- Transferability: Users can transfer their vault tokens to other addresses, effectively transferring their share of the vault without withdrawing assets.
+- Composability: Vault tokens can potentially be used in other DeFi protocols, increasing the utility of the user's deposit.
 
 ### Liquidity Mining
 
@@ -32,30 +40,27 @@ In addition to metadata for frontend applications, it contains configuration opt
 
 ```rust
 pub struct InstantiateMsg {
-    // Some metadata about the vault
-    pub name: String,
-    pub description: Option<String>,
-    pub image: Option<String>,
-    // Must be a CL pool
-    pub pool_id: u64,
-    // Update users frequency (adding users that want to join and removing users that want to leave), in seconds
-    pub min_update_frequency: Option<u64>,
-    // Interval after which ForceExits can be called, in seconds
-    pub max_update_frequency: Option<u64>,
-    // Seconds after which a price quote is rejected and joins/leaves can't be processed
-    pub price_expiry: u64,
-    //  Uptime must be enforced to accurately calculate commission
-    pub min_uptime: Option<u64>,
+    pub metadata: Option<Metadata>,
     // CL Assets with their corresponding pyth price feed
     pub asset0: VaultAsset,
     pub asset1: VaultAsset,
-    pub dollar_cap: Option<Uint128>, // with 8 decimals. Example: If vault cap is 50k USD we pass here 50000 * 10^8 = "5000000000000"
-    // Vault commission (in %)
+    // Minimum amount of tokens that can be deposited in a single tx
+    pub min_asset0: Uint128,
+    pub min_asset1: Uint128,
+    // Seconds after which a price quote is rejected and entries can't be processed
+    pub price_expiry: u64,
+    // Must be a CL pool
+    pub pool_id: u64,
+    // Minimum amount of tokens that can be redeemed in a single tx
+    pub min_redemption: Option<Uint128>,
+    // USD cap: 1 * 10^(18+8) = 1 USD
+    pub dollar_cap: Option<Uint128>,
+    // Vault commission, as a percentage
     pub commission: Option<Decimal>,
-    // If no address specified, contract admin will be receiver of commissions
+    // If not specified, receiver will be set to the owner
     pub commission_receiver: Option<Addr>,
-    // Flag to take the right pyth contract address - defaults to mainnet
-    pub mainnet: Option<bool>,
+    // Used to get the desired pyth contract address - defaults to mainnet
+    pub env: Option<Environment>,
     // Vault operator address
     pub operator: Addr,
 }
@@ -66,41 +71,85 @@ pub struct VaultAsset {
     pub price_identifier: PriceIdentifier,
     // Need to know decimals to convert from pyth price to asset price
     pub decimals: u32,
-    // The minimum amount of tokens that can be deposited in a single tx
-    pub min_deposit: Uint128,
 }
 ```
 
 ### Execute
 
-`ExecuteMsg` is used to execute actions on the contract.
+`ExecuteMsg` is used to execute actions on the contract. It includes the following top level messages:
 
-`Join` creates a new pending deposit. It takes no params, but must be sent with valid coins, defined as one or both of the vault's assets. The amount of each asset must be greater than the minimum deposit amount for that asset.
+- `ManageVault`: Admin functions for managing the vault
+- `ManagePosition`: Functions for managing liquidity positions
+- `Deposit`: Functions for joining or leaving the vault
+- `Cancel`: Functions for canceling pending join/leave requests
+- `Unlock`: A dead man switch to unlock the vault after 14 days of operator inactivity
 
-`Leave` starts a withdrawal. It takes an optional address, which if provided will remove an account other than the sender. Removing other accounts is restricted to the vault operator.
+#### ManageVault (VaultMsg)
 
-If the configured `min_update_frequency` has passed, the vault will execute `ProcessNewEntriesAndExits` to process all pending deposits and withdrawals the next time its LP position is fully closed and all assets have beens returned to the vault balance for processing.
+- `Modify`: Allows modifying various vault settings (operator, config, pool ID, commission, whitelist)
+- `CompoundRewards`: Compounds rewards for a specific position or all positions
+- `CollectCommission`: Collects the accumulated commission
+- `ProcessMints`: Processes pending deposits
+- `ProcessBurns`: Processes pending withdrawals
+- `Halt`: Pauses deposits and exits
+- `Resume`: Resumes deposits and exits
 
-`CreatePosition`, `AddToPosition` and `WithdrawPosition` are used by the vault operator to manage the vault's liquidity. These functions are essentially wrappers for the equivalent Osmosis messages, with the addition of a `swap` parameter which allows the operator to specify a swap in the same message.
+#### ManagePosition (PositionMsg)
 
-`Halt` and `Resume` are used to pause and resume the vault. When the vault is paused, no new deposits or withdrawals will be processed or can be created. The vault will continue to process pending deposits and withdrawals when it is resumed.
+- `CreatePosition`: Creates a new liquidity position
+- `AddToPosition`: Adds liquidity to an existing position
+- `WithdrawPosition`: Withdraws liquidity from a position
 
-`CloseVault` is used to close the vault permanently. All pending deposits will be canceled and all active addresses will be queued for withdrawal at the next update.
+#### Deposit (DepositMsg)
 
-`ForceExits` is a contingency in case the vault operator is unable to make further updates, as deposits and withdrawals are only processed when the LP position is fully closed. It may be called by any account to process all pending deposits and withdrawals, if the last time `ProcessNewEntriesAndExits` has been called was longer ago than the configured `max_update_frequency`.
+- `Mint`: Deposits assets into the vault
+- `Burn`: Withdraws assets from the vault
+
+#### Cancel (CancelMsg)
+
+- `Mint`: Cancels a pending deposit
+- `Burn`: Cancels a pending withdrawal
+
+#### Unlock
+
+Called to unlock the vault and allow manual redemptions after 14 days of operator inactivity.
+
 
 ```rust
 pub enum ExecuteMsg {
-    // If for some reason the pyth oracle contract address or the price identifiers change, we can update it (also for testing)
-    ModifyConfig {
-        config: Box<Config>,
+    ManageVault(VaultMsg),
+    ManagePosition(PositionMsg),
+    Deposit(DepositMsg),
+    Cancel(CancelMsg),
+    Unlock,
+}
+
+pub enum VaultMsg {
+    Modify(ModifyMsg),
+    CompoundRewards {
+        position_id: Option<u64>,
+        override_uptime: Option<bool>,
+        swap: Vec<Swap>,
     },
-    // Manage addresses whitelisted to exceed deposit limits
+    CollectCommission,
+    ProcessMints,
+    ProcessBurns,
+    Halt,
+    Resume,
+}
+
+pub enum ModifyMsg {
+    Operator(Addr),
+    Config(Box<Config>),
+    PoolId(u64),
+    Commission(Decimal),
     Whitelist {
-        add: Vec<Addr>,
-        remove: Vec<Addr>,
+        add: Option<Vec<Addr>>,
+        remove: Option<Vec<Addr>>,
     },
-    // Create position
+}
+
+pub enum PositionMsg {
     CreatePosition {
         lower_tick: i64,
         upper_tick: i64,
@@ -109,7 +158,6 @@ pub enum ExecuteMsg {
         token_min_amount1: String,
         swap: Option<Swap>,
     },
-    // Add to position
     AddToPosition {
         position_id: u64,
         amount0: String,
@@ -117,27 +165,28 @@ pub enum ExecuteMsg {
         token_min_amount0: String,
         token_min_amount1: String,
         swap: Option<Swap>,
+        override_uptime: Option<bool>,
     },
-    // Withdraw position
     WithdrawPosition {
         position_id: u64,
         liquidity_amount: String,
+        override_uptime: Option<bool>,
     },
-    // Process entries and exits (done internally by the contract every update frequency)
-    ProcessNewEntriesAndExits {},
-    // Join vault
-    Join {},
-    // Leave vault. If no address is specified, the sender will be removed. only the operator can remove other addresses
-    Leave {
+}
+
+pub enum DepositMsg {
+    Mint {
+        min_out: Option<Uint128>,
+    },
+    Burn {
         address: Option<Addr>,
+        amount: Option<Uint128>,
     },
-    // Halt and Resume for Admin
-    Halt {},
-    Resume {},
-    // Close vault. If this is triggered the vault will be closed, nobody else can join and all funds will be withdrawn and sent to the users during next update
-    CloseVault {},
-    // Dead man switch
-    ForceExits {},
+}
+
+pub enum CancelMsg {
+    Mint { address: Option<Addr> },
+    Burn { address: Addr },
 }
 
 pub struct Swap {
@@ -149,53 +198,96 @@ pub struct Swap {
 
 ### Query
 
-`QueryMsg` is used to query the contract state.
+`QueryMsg` is used to query the contract state. It includes the following top level queries:
 
-`TotalActiveAssets` returns the total amount of each asset the vault currently holds, minus any pending deposits. `TotalPendingAssets` returns the total amount of pending deposits.
+- `EstimateDeposit`: Estimates the result of a deposit or withdrawal
+- `LockedAssets`: Returns the total amount of locked assets in the vault
+- `AccountStatus`: Queries the status of accounts for minting or burning
+- `Rewards`: Queries commission or uncompounded rewards
+- `Whitelist`: Returns a paginated list of whitelisted addresses
+- `VaultState`: Queries the vault's information or status
 
-`CanUpdate` returns a boolean indicating whether the contract can process new entries and exits, determined by the last time `ProcessNewEntriesAndExits` was called and the configured `min_update_frequency`.
+#### EstimateDeposit
 
-`PendingJoin` takes a parameter `address` and returns the amount of each asset the account has pending to join the vault. `AccountsPendingExit` returns a list of all accounts that have pending withdrawals.
+Estimates the result of a deposit (Mint) or withdrawal (Burn) operation.
 
-`VaultRatio` takes a parameter `address` and returns the ratio of the vault's assets that the account owns.
+#### LockedAssets
 
-`WhitelistedDepositors` returns a paginated list of whitelisted addresses.
+Returns the total amount of assets currently locked in the vault.
+
+#### AccountStatus
+
+Queries the status of accounts for minting (depositing) or burning (withdrawing). It returns a list of `AccountResponse` objects containing the address, amount, and minimum output for each account.
+
+#### Rewards
+
+Queries either the accumulated commission or uncompounded rewards.
+
+#### Whitelist
+
+Returns a paginated list of whitelisted addresses.
+
+#### VaultState
+
+Queries the vault's information (Info) or current status (Status). The Info state includes details about the vault's assets, pool ID, owner, operator, commission rate, and configuration. The Status state includes information about join time, last update, various flags (uptime locked, cap reached, halted, terminated), and supply details.
 
 ```rust
 pub enum QueryMsg {
-    #[returns(Config)]
-    Config {},
-    // Tells you how much of each vault asset is currently being used (not pending join)
-    #[returns(TotalAssetsResponse)]
-    TotalActiveAssets {},
-    // Tells you how much is pending join in total
-    #[returns(TotalAssetsResponse)]
-    TotalPendingAssets {},
-    // Checks if the contract can process new entries and exits
-    #[returns(bool)]
-    CanUpdate {},
-    // Tells you how much of each vault asset is pending to join for an address
     #[returns(Vec<Coin>)]
-    PendingJoin { address: Addr },
-    #[returns(Vec<Addr>)]
-    AccountsPendingExit {},
-    // How much of the vault this address owns
-    #[returns(Decimal)]
-    VaultRatio { address: Addr },
-    #[returns(WhitelistedDepositorsResponse)]
-    WhitelistedDepositors {
+    EstimateDeposit(DepositQuery),
+    #[returns(Vec<Coin>)]
+    LockedAssets,
+    #[returns(Vec<AccountResponse>)]
+    AccountStatus(AccountQuery),
+    #[returns(Vec<Coin>)]
+    Rewards(RewardQuery),
+    #[returns(WhitelistResponse)]
+    Whitelist {
         start_after: Option<Addr>,
         limit: Option<u32>,
     },
+    #[returns(State)]
+    VaultState(StateQuery),
 }
 
-pub struct TotalAssetsResponse {
-    pub asset0: Coin,
-    pub asset1: Coin,
+pub enum DepositQuery {
+    Mint(Vec<Coin>),
+    Burn(Uint128),
 }
 
-pub struct WhitelistedDepositorsResponse {
+pub enum AccountQuery {
+    Mint(AccountQueryParams),
+    Burn(AccountQueryParams),
+}
+
+pub struct AccountQueryParams {
+    pub address: Option<Addr>,
+    pub start_after: Option<Addr>,
+    pub limit: Option<u32>,
+}
+
+pub struct AccountResponse {
+    pub address: Addr,
+    pub amount: Vec<Coin>,
+    pub min_out: Option<Uint128>,
+}
+
+pub enum RewardQuery {
+    Commission,
+    Uncompounded,
+}
+
+pub struct WhitelistResponse {
     pub whitelisted_depositors: Vec<Addr>,
 }
-```
 
+pub enum State {
+    Info { /* ... */ },
+    Status { /* ... */ },
+}
+
+pub enum StateQuery {
+    Info,
+    Status,
+}
+```
